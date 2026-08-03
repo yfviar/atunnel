@@ -1,0 +1,20 @@
+[
+  {
+    "listen": 1230,
+    "target_host": "172.20.2.14",
+    "target_port": 1230,
+    "name": "OneAPI网关"
+  },
+  {
+    "listen": 32279,
+    "target_host": "172.20.2.15",
+    "target_port": 32279,
+    "name": "物管Redis"
+  },
+  {
+    "listen": 58204,
+    "target_host": "172.20.2.15",
+    "target_port": 58204,
+    "name": "Nacos"
+  }
+]

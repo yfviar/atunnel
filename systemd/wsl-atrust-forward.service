@@ -1,0 +1,14 @@
+[Unit]
+Description=WSL aTrust transparent forward (172.20.2.14:1230 via socat -> portproxy)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/atunnel-forward.sh start
+ExecStop=/usr/local/bin/atunnel-forward.sh stop
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

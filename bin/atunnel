@@ -1,0 +1,118 @@
+#!/bin/bash
+# atunnel: aTunnel 统一管理命令 (WSL <-> aTrust 内网透明转发)
+# 子命令:
+#   list                    列出所有映射(含状态/连通性)
+#   add <IP> <端口> [名称]  一键热新增
+#   del <IP> <端口>         一键热删除
+#   status                  整体状态
+#   restart [端口]          重启 Windows 转发器
+#   log [行数]              查看转发器日志
+#   help                    帮助
+# 作者: weiyufei
+
+GREEN='\033[0;32m'; RED='\033[0;31m'; YELLOW='\033[1;33m'; NC='\033[0m'
+
+usage() {
+  echo "用法: atunnel <list|add|del|status|restart|log|help>"
+  echo ""
+  echo "  list                    列出所有映射(名称/目标/本地端口/状态/连通性)"
+  echo "  add <IP> <端口> [名称]  一键热新增映射"
+  echo "  del <IP> <端口>         一键热删除映射"
+  echo "  status                  整体状态(aTrust在线/IP/进程/规则)"
+  echo "  restart [端口]          重启 Windows 转发器"
+  echo "  log [行数]              查看转发器日志(默认20行)"
+}
+
+cmd_list() {
+  python3 <<'EOF'
+import json, socket, subprocess, time
+
+WIN_JSON = "/mnt/c/Users/yfvia/AppData/Local/wsl-atrust-portmapper/portmapper.json"
+WSL_CONF = "/etc/wsl-atrust-forward.conf"
+
+def probe(host, port, timeout=1.5):
+    try:
+        s = socket.create_connection((host, port), timeout=timeout)
+        s.close()
+        return True
+    except Exception:
+        return False
+
+def ss_listening(port):
+    try:
+        out = subprocess.run(["ss", "-tln"], capture_output=True, text=True, timeout=3).stdout
+        return ":%d " % port in out
+    except Exception:
+        return False
+
+try:
+    with open(WIN_JSON, encoding="utf-8") as f:
+        maps = json.load(f)
+except Exception as e:
+    print("读取 Windows 配置失败:", e); maps = []
+
+socat_map = {}
+try:
+    for line in open(WSL_CONF, encoding="utf-8"):
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        p = line.split()
+        if len(p) == 3:
+            socat_map[(p[0], int(p[1]))] = int(p[2])
+except Exception:
+    pass
+
+G, R, Y, N = "\033[0;32m", "\033[0;31m", "\033[1;33m", "\033[0m"
+print(f"{'名称':<14}{'目标地址':<20}{'本地端口':<14}{'状态':<10}连通性")
+print("-" * 74)
+for m in maps:
+    name = m.get("name", "-")
+    host = m.get("target_host"); port = m.get("target_port"); listen = m.get("listen")
+    key = (host, port)
+    socat_ok = key in socat_map and ss_listening(socat_map[key])
+    win_ok = probe("127.0.0.1", listen)
+    st = f"{G}正常{N}" if (socat_ok and win_ok) else f"{R}异常{N}"
+    ok = probe(host, port, 2)
+    conn = f"{G}通{N}" if ok else f"{R}不通{N}"
+    print(f"{name:<14}{host + ':' + str(port):<20}127.0.0.1:{listen:<9}{st:<14}{conn}")
+if not maps:
+    print("(无映射)")
+EOF
+}
+
+cmd_status() {
+  echo "=== 整体状态 ==="
+  local ip=$(ip -4 addr show eth4 2>/dev/null | awk '/inet /{gsub(/\/.*/,"",$2); print $2; exit}')
+  if ip link show eth7 2>/dev/null | grep -q "state UP"; then
+    printf "  aTrust 虚拟网卡(eth7): %b在线%b\n" "$GREEN" "$NC"
+  else
+    printf "  aTrust 虚拟网卡(eth7): %b断开%b\n" "$RED" "$NC"
+  fi
+  echo "  本机 IP(eth4):        ${ip:-无}"
+  printf "  服务状态:             %b%s%b\n" "$GREEN" "$(systemctl is-active wsl-atrust-forward)" "$NC"
+  echo ""
+  echo "=== iptables DNAT 规则 ==="
+  iptables -t nat -S OUTPUT | grep 172.20 | sed 's/^/  /'
+  echo ""
+  echo "=== socat 进程 ==="
+  ps aux | grep "socat TCP" | grep -v grep | awk '{printf "  PID %s -> %s\n", $2, $NF}' | head -10
+}
+
+cmd_log() {
+  local n=${1:-20}
+  local logfile="/mnt/c/Users/yfvia/AppData/Local/wsl-atrust-portmapper/portmapper.log"
+  echo "=== 转发器日志 (最近 $n 行) ==="
+  tail -n "$n" "$logfile" 2>/dev/null || echo "日志文件不存在"
+}
+
+case "$1" in
+  list)    cmd_list ;;
+  add)     shift; /usr/local/bin/atunnel-add "$@" ;;
+  del)     shift; /usr/local/bin/atunnel-del "$@" ;;
+  status)  cmd_status ;;
+  restart) shift; /usr/local/bin/atunnel-restart "$@" ;;
+  log)     shift; cmd_log "$@" ;;
+  help|-h) usage ;;
+  *)       usage ;;
+esac
