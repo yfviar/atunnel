@@ -68,8 +68,16 @@ stop_all() {
 
 case "$1" in
   start)
+    # 等待 aTrust 就绪 (最多 30 次 x 10s = 5 分钟, 覆盖 Windows 重启后 aTrust 慢启动场景)
+    for i in $(seq 1 30); do
+      if in_atrust_net; then
+        break
+      fi
+      echo "等待 aTrust 就绪 (eth7 未在线) ... ${i}/30"
+      sleep 10
+    done
     if ! in_atrust_net; then
-      echo "不在 aTrust 网络环境 (eth7 未在线或无 eth4 IP), 跳过"
+      echo "等待超时: aTrust 未就绪, 跳过 (可 systemctl restart 重试)"
       exit 0
     fi
     start_all
