@@ -60,6 +60,9 @@ start_all() {
 stop_all() {
   [ -f "$PIDFILE" ] && xargs -r kill < "$PIDFILE" 2>/dev/null
   rm -f "$PIDFILE"
+  # 兜底: 清理 pidfile 之外的残留 socat (服务重启时可能遗漏)
+  pkill -f "socat TCP-LISTEN" 2>/dev/null
+  sleep 0.5
   while read -r ip port lport; do
     [ -z "$ip" ] && continue
     case "$ip" in \#*) continue;; esac
