@@ -15,7 +15,8 @@ GREEN='\033[0;32m'; RED='\033[0;31m'; YELLOW='\033[1;33m'; NC='\033[0m'
 usage() {
   echo "用法: atunnel <list|add|del|status|restart|log|help>"
   echo ""
-  echo "  list                    列出所有映射(名称/目标/本地端口/状态/连通性)"
+  echo "  list                    列出所有映射(名称/目标/本地端口/状态/连通性)
+  verify [--fix]            一致性校验(配置 vs 运行态, --fix 自动修复)"
   echo "  add <IP> <端口> [名称]  一键热新增映射"
   echo "  del <IP> <端口>         一键热删除映射"
   echo "  status                  整体状态(aTrust在线/IP/进程/规则)"
@@ -112,7 +113,9 @@ case "$1" in
   del)     shift; /usr/local/bin/atunnel-del "$@" ;;
   status)  cmd_status ;;
   restart) shift; /usr/local/bin/atunnel-restart "$@" ;;
+  verify)  shift; /usr/local/bin/atunnel-verify "$@" ;;
   log)     shift; cmd_log "$@" ;;
   help|-h) usage ;;
   *)       usage ;;
 esac
+
