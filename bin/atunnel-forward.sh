@@ -9,13 +9,14 @@ CONF=/etc/wsl-atrust-forward.conf
 PIDFILE=/run/wsl-atrust-socats.pid
 SOCAT_LOG=/var/log/wsl-atrust-socat.log
 
-# 动态获取 eth4 IP (DHCP 变化自动适配)
+# 动态获取物理网卡 IP (172.16.203.x, 按网段识别; WSL 重启后接口名可能漂移, 不能用固定 ethN)
 get_local_ip() {
-  ip -4 addr show eth4 2>/dev/null | awk '/inet /{gsub(/\/.*/,"",$2); print $2; exit}'
+  ip -4 addr show 2>/dev/null | awk '/inet 172\.16\.203\./{gsub(/\/.*/,"",$2); print $2; exit}'
 }
 
+# aTrust 在线判断: 存在 2.0.0.x (aTrustVNIC) 且有物理网卡 IP
 in_atrust_net() {
-  ip link show eth7 2>/dev/null | grep -q "state UP" && [ -n "$(get_local_ip)" ]
+  ip -4 addr show 2>/dev/null | grep -q "inet 2\.0\.0\." && [ -n "$(get_local_ip)" ]
 }
 
 add_rule() {
@@ -31,7 +32,7 @@ del_rule() {
 
 add_one() {
   local ip=$1 port=$2 lport=$3
-  [ -z "$(get_local_ip)" ] && { echo "eth4 无 IP, 跳过"; return 1; }
+  [ -z "$(get_local_ip)" ] && { echo "物理网卡无 IP, 跳过"; return 1; }
   add_rule "$ip" "$port" "$lport"
   [ -f "$PIDFILE" ] || : > "$PIDFILE"
   nohup /usr/bin/socat TCP-LISTEN:"${lport}",bind="$(get_local_ip)",reuseaddr,fork TCP:127.0.0.1:"${port}" >> "$SOCAT_LOG" 2>&1 &

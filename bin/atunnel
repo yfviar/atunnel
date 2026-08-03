@@ -83,13 +83,13 @@ EOF
 
 cmd_status() {
   echo "=== 整体状态 ==="
-  local ip=$(ip -4 addr show eth4 2>/dev/null | awk '/inet /{gsub(/\/.*/,"",$2); print $2; exit}')
-  if ip link show eth7 2>/dev/null | grep -q "state UP"; then
-    printf "  aTrust 虚拟网卡(eth7): %b在线%b\n" "$GREEN" "$NC"
+  local ip=$(ip -4 addr show 2>/dev/null | awk '/inet 172\.16\.203\./{gsub(/\/.*/,"",$2); print $2; exit}')
+  if ip -4 addr show 2>/dev/null | grep -q "inet 2\\.0\\.0\\."; then
+    printf "  aTrust 虚拟网卡(2.0.0.x): %b在线%b\n" "$GREEN" "$NC"
   else
-    printf "  aTrust 虚拟网卡(eth7): %b断开%b\n" "$RED" "$NC"
+    printf "  aTrust 虚拟网卡(2.0.0.x): %b断开%b\n" "$RED" "$NC"
   fi
-  echo "  本机 IP(eth4):        ${ip:-无}"
+  echo "  本机 IP(物理网卡):        ${ip:-无}"
   printf "  服务状态:             %b%s%b\n" "$GREEN" "$(systemctl is-active wsl-atrust-forward)" "$NC"
   echo ""
   echo "=== iptables DNAT 规则 ==="
