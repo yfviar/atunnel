@@ -1,53 +1,63 @@
 ---
 name: atunnel
-description: 当需要访问 aTrust 零信任内网服务（如 172.20.2.x 网段的 Redis/Nacos/API/数据库），或检测到应用连接内网地址超时失败、需要将目标加入 aTunnel 桥接时使用。触发词：内网、aTrust、aTunnel、连不上、172.20.2、物管Redis、Nacos、OneAPI、内网服务。
+description: 需要访问 aTrust 零信任内网（172.20.2.x 等）服务时使用，用清单驱动的 aTunnel v2 桥接；含多环境串台排查、身份指纹校验、进程端口冲突体检。触发词：内网、aTrust、aTunnel、连不上、超时、172.20.2、Nacos、Redis、PG、内网服务、串台、端口冲突。
 ---
 
-# aTunnel 技能：自动判断并桥接 aTrust 内网服务
+# aTunnel v2 技能：清单驱动的内网桥接
 
-## 作用
+## 0. 一句话原则
 
-让 agent 在遇到"需要访问 aTrust 认证内网服务"的场景时，**自动判断目标是否应该加入 aTunnel 桥接**，并自动完成添加，无需用户手动配置。
+**环境身份靠"内容指纹"证明，不靠 IP/端口/命名空间猜。** 地址无法标识环境（同 IP 多服务、同端口多主机、同名命名空间）——v1 就栽在这里。
 
-## 判断流程（三步，全部满足才添加）
-
-1. **目标是否属于 aTrust 内网段**
-   - 默认内网段: `172.20.2.0/24`（可用 `atunnel status` 或配置文件确认）
-   - 命中内网段 → 继续；否则 → **不需要桥接**，正常直连
-
-2. **直连是否失败**
-   - 执行 `timeout 3 nc -zv <IP> <PORT>`，超时/无响应，或应用报连接超时
-   - 直连失败 → 继续；成功 → **不需要桥接**
-
-3. **是否已有映射**
-   - `atunnel list` 检查是否存在 `<IP>:<PORT>`
-   - 已有 → 不重复添加，改用 `atunnel status` 检查链路健康
-   - 没有 → 执行添加
-
-## 操作命令
+## 1. 先体检（不要先猜）
 
 ```bash
-atunnel add <IP> <PORT> <名称>   # 一键热新增（自动端口检查、WSL+Windows 同步、链路验证）
-atunnel list                     # 查看映射与连通性
-atunnel status                   # 整体状态（aTrust在线/IP/服务/规则）
-atunnel log [行数]               # 转发器日志（排查连接问题）
-atunnel del <IP> <PORT>          # 删除映射（服务下架时）
-atunnel restart [端口]           # 应急重启 Windows 转发器
+atunnel --version
+atunnel status                 # aTrust 网卡 / 本机 IP / 单元 / 清单摘要
+atunnel doctor                 # 全量对照表：声明地址 / 桥接实际目标 / 指纹 / 结论
+atunnel ports --check          # 端口体检（清单互斥、跨 env、与本机监听）
 ```
 
-## 边界与注意事项
+## 2. 故障三分类（按症状定位）
 
-- **仅 TCP**：UDP 服务（DNS/NTP/部分数据库）不支持，不要尝试添加
-- **端口冲突**：`atunnel-add` 自动检查；报冲突时换端口或先确认
-- **依赖**：aTrust 客户端在线 + Windows portmapper 运行；`atunnel status` 显示 eth7 断开或服务 inactive 时，先修复链路再添加
-- **新增后验证**：添加完成后用 `nc -zv` 或应用实际连接验证连通性
-- **常见误区**：目标是局域网同段（如 172.16.203.x）且能连通时，**不要**加桥接（物理直连即可）；只有 aTrust 内网段才需要桥接
+| 症状 | 归类 | 首查 |
+|---|---|---|
+| 连接超时 / 拒绝 / 认证莫名失败 | **类 A 不通** | `atunnel plan`（是否有待应用变更）、`ss -ltn` 本机监听、`atunnel status` 单元状态 |
+| 能连上但**内容不对**（配置读空、数据不对、用户不存在） | **类 B 错连** | `atunnel doctor` → 看"桥接实际目标 vs 声明"与**指纹**是否指向别的 env |
+| 配置来自 A 环境、数据却在 B 环境（现象最飘） | **类 C 混搭** | `atunnel doctor <env>` 逐行看：Nacos/Redis/PG **必须同一 env** |
+| 服务"起来了但少个能力"（如消费者不工作） | **残留规则优先命中** | `iptables -t nat -S OUTPUT` 看**顺序**：靠前的失效规则（目标≠`127.0.0.1` 且≠清单 `local`）会先命中 → `atunnel apply` 修 |
 
-## 排查速查
+## 3. 修与验
 
-| 现象 | 处理 |
-|---|---|
-| `atunnel list` 显示"异常" | 检查 eth7 在线 + Windows 转发器进程 + 端口监听 |
-| 连接立即 refused | 目标端口本身无服务，或端口冲突 |
-| 连接超时 | aTrust 隧道未建立 / Windows 转发器未运行 |
-| 连接 10 秒反复断开 | 曾由 portmapper timeout bug 导致（已修复），若重现检查转发器是否为最新版 |
+```bash
+atunnel plan            # 只读预览（退出码 10 = 有待应用变更）
+atunnel apply           # 幂等应用（两侧桥接 + 结构自检；失败非 0）
+atunnel verify <env>    # 身份校验；输出会指出"串到哪个 env"
+atunnel selftest        # 校验层自身自检
+```
+
+## 4. 新增/修改映射（唯一正确路径）
+
+1. 打开 `/etc/atunnel/environments.json`（模板 `config/environments.json.example`）；
+2. 加/改 `services`（`target` → `local` + `fingerprint`）或 `runtime_ports`；
+3. `atunnel plan` → `atunnel apply` → `atunnel doctor`。
+
+**禁止**：`atunnel add|del|restart`（v1 入口，已停用）、手工 `iptables -A`、手工改 `portmapper.json`——都会绕过清单，重新引入静默错配。
+
+## 5. 多项目并行（进程端口层）
+
+- 每项目一段：如 `9200-9299/18080/ui 80` vs `9300-9399/8080/ui 8082`；
+- 服务端口若来自 `bootstrap.yml`，用启动脚本 `-Dserver.port=<段内端口>` 覆盖（实测有效，**不改仓库、不重编 jar**）；前端用 `npm run dev -- --port <段内端口>`；
+- 启动脚本首行：`atunnel-env preflight <env> --role <role> || exit 1`（`--role` 让端口检查只针对本角色，避免顺序启动互相误报）。
+
+## 6. 新项目接入
+
+照 `docs/env-onboarding.md`：取空闲端口段 → 登记 env（`services` + `runtime_ports` + `fingerprint`）→ `plan/apply/doctor/ports --check` → 脚本接入 preflight → 项目 `AGENTS.md` 写明 env id。
+
+## 7. 关键事实（排查时的先验）
+
+- **一个本地端口只能有一个目标**：Windows 转发器按 `listen` 索引；多环境同端口号（如 `58204/58202/58201`）必须各配不同 `local`；
+- **DNAT + SNAT 成对**：mirrored 模式下 `127.0.0.1` 经 `loopback0` 镜像到 Windows 回环，**只接受回环源地址**；`OUTPUT` 链不支持 SNAT，必须放 `POSTROUTING`；
+- **规则不持久**：`iptables` 易失 → `atunnel-env.service`（oneshot）开机 `apply` 自愈；手工加的规则会在重启后消失；
+- **判定"两条链路是否同源"必须按目标分别取内容指纹**，禁止用"我从哪条链路进来的/哪个代理变量生效"当自变量；
+- **比较内容长度注意字符数 vs 字节数**（中文 UTF-8 每字 3 字节），否则会误判为"后端返回不一致"。

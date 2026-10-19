@@ -1,121 +1,90 @@
 #!/bin/bash
-# atunnel: aTunnel 统一管理命令 (WSL <-> aTrust 内网透明转发)
-# 子命令:
-#   list                    列出所有映射(含状态/连通性)
-#   add <IP> <端口> [名称]  一键热新增
-#   del <IP> <端口>         一键热删除
-#   status                  整体状态
-#   restart [端口]          重启 Windows 转发器
-#   log [行数]              查看转发器日志
-#   help                    帮助
+# atunnel v2 — aTunnel 统一管理命令（WSL ↔ aTrust 内网；清单驱动）
 # 作者: weiyufei
-
-GREEN='\033[0;32m'; RED='\033[0;31m'; YELLOW='\033[1;33m'; NC='\033[0m'
+GREEN=$'\033[0;32m'; RED=$'\033[0;31m'; YELLOW=$'\033[1;33m'; NC=$'\033[0m'
+VERSION_FILE="/usr/local/share/atunnel/VERSION"
 
 usage() {
-  echo "用法: atunnel <list|add|del|status|restart|log|help>"
-  echo ""
-  echo "  list                    列出所有映射(名称/目标/本地端口/状态/连通性)
-  verify [--fix]            一致性校验(配置 vs 运行态, --fix 自动修复)"
-  echo "  add <IP> <端口> [名称]  一键热新增映射"
-  echo "  del <IP> <端口>         一键热删除映射"
-  echo "  status                  整体状态(aTrust在线/IP/进程/规则)"
-  echo "  restart [端口]          重启 Windows 转发器"
-  echo "  log [行数]              查看转发器日志(默认20行)"
-}
+  cat <<'EOF'
+用法: atunnel <子命令>
 
-cmd_list() {
-  python3 <<'EOF'
-import json, socket, subprocess, time
+  version                 版本
+  status                  整体状态（aTrust 网卡 / 本机 IP / 服务单元 / 清单摘要）
+  list                    清单中的端点（委托 atunnel-env list）
+  log [行数]              Windows 转发器日志（默认 30 行）
+  plan|apply|verify|doctor|ports|preflight|selftest|refresh
+                          委托 atunnel-env（原样透传参数，如 --prune / --check / --role / <env>）
+  refresh [env]           把实测指纹写回清单（Redis run_id / PG 地址变化后使用）
+  help                    本帮助
 
-WIN_JSON = "/mnt/c/Users/yfvia/AppData/Local/wsl-atrust-portmapper/portmapper.json"
-WSL_CONF = "/etc/wsl-atrust-forward.conf"
-
-def probe(host, port, timeout=1.5):
-    try:
-        s = socket.create_connection((host, port), timeout=timeout)
-        s.close()
-        return True
-    except Exception:
-        return False
-
-def ss_listening(port):
-    try:
-        out = subprocess.run(["ss", "-tln"], capture_output=True, text=True, timeout=3).stdout
-        return ":%d " % port in out
-    except Exception:
-        return False
-
-try:
-    with open(WIN_JSON, encoding="utf-8") as f:
-        maps = json.load(f)
-except Exception as e:
-    print("读取 Windows 配置失败:", e); maps = []
-
-socat_map = {}
-try:
-    for line in open(WSL_CONF, encoding="utf-8"):
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        p = line.split()
-        if len(p) == 3:
-            socat_map[(p[0], int(p[1]))] = int(p[2])
-except Exception:
-    pass
-
-G, R, Y, N = "\033[0;32m", "\033[0;31m", "\033[1;33m", "\033[0m"
-print(f"{'名称':<14}{'目标地址':<20}{'本地端口':<14}{'状态':<10}连通性")
-print("-" * 74)
-for m in maps:
-    name = m.get("name", "-")
-    host = m.get("target_host"); port = m.get("target_port"); listen = m.get("listen")
-    key = (host, port)
-    socat_ok = key in socat_map and ss_listening(socat_map[key])
-    win_ok = probe("127.0.0.1", listen)
-    st = f"{G}正常{N}" if (socat_ok and win_ok) else f"{R}异常{N}"
-    ok = probe(host, port, 2)
-    conn = f"{G}通{N}" if ok else f"{R}不通{N}"
-    print(f"{name:<14}{host + ':' + str(port):<20}127.0.0.1:{listen:<9}{st:<14}{conn}")
-if not maps:
-    print("(无映射)")
+  add|del|restart         v1 命令，已停用（按端口号建映射，会绕过清单）
+  新增/修改映射：改 /etc/atunnel/environments.json → atunnel plan → atunnel apply → atunnel doctor
 EOF
 }
 
+cmd_version() {
+  if [ -f "$VERSION_FILE" ]; then cat "$VERSION_FILE"
+  else cat "$(dirname "$(readlink -f "$0")")/../VERSION" 2>/dev/null || echo unknown; fi
+}
+
+unit_state() {  # $1=unit  输出 "<enabled>/<active>"，无该 unit 时输出 "-"
+  if systemctl list-unit-files "$1" >/dev/null 2>&1 && systemctl cat "$1" >/dev/null 2>&1; then
+    printf '%s/%s' "$(systemctl is-enabled "$1" 2>/dev/null)" "$(systemctl is-active "$1" 2>/dev/null)"
+  else printf -- '-'; fi
+}
+
 cmd_status() {
-  echo "=== 整体状态 ==="
-  local ip=$(ip -4 addr show 2>/dev/null | awk '/inet 172\.16\.203\./{gsub(/\/.*/,"",$2); print $2; exit}')
-  if ip -4 addr show 2>/dev/null | grep -q "inet 2\\.0\\.0\\."; then
-    printf "  aTrust 虚拟网卡(2.0.0.x): %b在线%b\n" "$GREEN" "$NC"
+  local ip
+  ip=$(ip -4 addr show 2>/dev/null | awk '/inet /{split($2,a,"/"); if (a[1] !~ /^127\.|^10\.255\.|^2\.0\.0\./) {print a[1]; exit}}')
+  printf '=== aTunnel v%s 状态 ===\n' "$(cmd_version)"
+  if ip -4 addr show 2>/dev/null | grep -q 'inet 2\.0\.0\.'; then
+    printf '  aTrust 虚拟网卡(2.0.0.x): %s在线%s\n' "$GREEN" "$NC"
   else
-    printf "  aTrust 虚拟网卡(2.0.0.x): %b断开%b\n" "$RED" "$NC"
+    printf '  aTrust 虚拟网卡(2.0.0.x): %s离线%s\n' "$RED" "$NC"
   fi
-  echo "  本机 IP(物理网卡):        ${ip:-无}"
-  printf "  服务状态:             %b%s%b\n" "$GREEN" "$(systemctl is-active wsl-atrust-forward)" "$NC"
-  echo ""
-  echo "=== iptables DNAT 规则 ==="
-  iptables -t nat -S OUTPUT | grep 172.20 | sed 's/^/  /'
-  echo ""
-  echo "=== socat 进程 ==="
-  ps aux | grep "socat TCP" | grep -v grep | awk '{printf "  PID %s -> %s\n", $2, $NF}' | head -10
+  printf '  本机 IP(物理网卡):        %s\n' "${ip:-未知}"
+  printf '  atunnel-env.service:      %s\n' "$(unit_state atunnel-env.service)"
+  printf '  wsl-atrust-forward(v1):   %s %s(v1 应已退役)%s\n' "$(unit_state wsl-atrust-forward.service)" "$YELLOW" "$NC"
+  if [ -f /etc/atunnel/environments.json ]; then
+    python3 - <<'PY' | sed 's/^/  /'
+import json
+m = json.load(open('/etc/atunnel/environments.json', encoding='utf-8'))
+n = sum(len(d['services']) for d in m['envs'].values())
+r = sum(len(d.get('runtime_ports') or {}) for d in m['envs'].values())
+print(f"清单: {len(m['envs'])} env / {n} 端点 / {r} 进程端口  ({', '.join(m['envs'])})")
+PY
+  else
+    printf '  清单: 未安装（参考 config/environments.json.example）\n'
+  fi
+  printf '  下发命令: plan apply verify doctor ports preflight selftest（详见 atunnel help）\n'
 }
 
 cmd_log() {
-  local n=${1:-20}
-  local logfile="/mnt/c/Users/yfvia/AppData/Local/wsl-atrust-portmapper/portmapper.log"
-  echo "=== 转发器日志 (最近 $n 行) ==="
-  tail -n "$n" "$logfile" 2>/dev/null || echo "日志文件不存在"
+  local n="${1:-30}" d="${ATUNNEL_WIN_DIR:-$(ls -d /mnt/c/Users/*/AppData/Local/wsl-atrust-portmapper 2>/dev/null | head -1)}"
+  if [ -f "$d/portmapper.log" ]; then tail -n "$n" "$d/portmapper.log"
+  else echo "未找到转发器日志（${d:-<未探测到 Windows 目录>}/portmapper.log）"; fi
 }
 
-case "$1" in
-  list)    cmd_list ;;
-  add)     shift; /usr/local/bin/atunnel-add "$@" ;;
-  del)     shift; /usr/local/bin/atunnel-del "$@" ;;
-  status)  cmd_status ;;
-  restart) shift; /usr/local/bin/atunnel-restart "$@" ;;
-  verify)  shift; /usr/local/bin/atunnel-verify "$@" ;;
-  log)     shift; cmd_log "$@" ;;
-  help|-h) usage ;;
-  *)       usage ;;
-esac
+cmd_deprecated() {
+  cat <<MSG
+[已弃用] atunnel $1 属 v1（按端口号建映射，会绕过环境清单 → 静默错配风险），v2 起停用；本次未做任何改动。
+请改清单式流程：
+  1) 编辑 /etc/atunnel/environments.json   （模板: config/environments.json.example）
+  2) atunnel plan          3) atunnel apply
+  4) atunnel doctor        5) atunnel ports --check
+v1 源码保留在 legacy/；接入指引见 docs/env-onboarding.md
+MSG
+  exit 1
+}
 
+sub="${1:-help}"
+case "$sub" in
+  version|--version|-v) cmd_version ;;
+  status)               cmd_status ;;
+  log)                  shift; cmd_log "$@" ;;
+  list|plan|apply|verify|doctor|ports|preflight|selftest|refresh)
+                        shift; exec /usr/local/bin/atunnel-env "$sub" "$@" ;;
+  add|del|restart)      cmd_deprecated "$sub" ;;
+  help|-h|--help|"")    usage ;;
+  *)                    printf '%s未知子命令: %s%s\n\n' "$RED" "$sub" "$NC"; usage; exit 1 ;;
+esac

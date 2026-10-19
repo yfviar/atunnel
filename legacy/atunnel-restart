@@ -1,0 +1,47 @@
+#!/bin/bash
+# wsl-atrust-restart: 自动重启 Windows 侧 python 转发器
+# 1. 精确查找运行 portmapper.py 的 pythonw 进程
+# 2. 温和终止(无 /F), 不生效则强制 (流程自动化的授权范围内)
+# 3. Start-Process 重新拉起 (独立进程, 不随 WSL 会话退出)
+# 4. 等待端口监听恢复并验证
+# 作者: weiyufei
+
+PS="/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe"
+PYW="C:\\Users\\yfvia\\AppData\\Local\\Programs\\Python\\Python313\\pythonw.exe"
+PM="C:\\Users\\yfvia\\AppData\\Local\\wsl-atrust-portmapper\\portmapper.py"
+CHECK_PORT=${1:-1230}   # 默认验证 1230 端口
+
+FIND_CMD="Get-CimInstance Win32_Process -Filter \"name='pythonw.exe'\" | Where-Object {\$_.CommandLine -like '*portmapper*'} | Select-Object -ExpandProperty ProcessId"
+
+echo "=== 1. 查找运行中的转发器进程 ==="
+PID=$("$PS" -NoProfile -Command "$FIND_CMD" 2>/dev/null | tr -d '\r' | grep -E '^[0-9]+$' | head -1)
+if [ -n "$PID" ]; then
+  echo "找到 PID=$PID, 温和终止 (taskkill 无 /F)..."
+  /mnt/c/Windows/System32/taskkill.exe /PID "$PID" >/dev/null 2>&1
+  sleep 2
+  if /mnt/c/Windows/System32/tasklist.exe 2>/dev/null | iconv -f GB18030 -t UTF-8 2>/dev/null | grep "pythonw.exe" | grep -q "$PID"; then
+    echo "温和终止未生效, 强制终止..."
+    /mnt/c/Windows/System32/taskkill.exe /F /PID "$PID" >/dev/null 2>&1
+    sleep 1
+  fi
+else
+  echo "未找到运行中的转发器 (可能未启动, 直接拉起)"
+fi
+
+echo "=== 2. 重新启动转发器 ==="
+START_CMD="Start-Process -FilePath '$PYW' -ArgumentList '$PM' -WindowStyle Hidden"
+"$PS" -NoProfile -Command "$START_CMD"
+echo "已拉起, 等待端口 ${CHECK_PORT} 监听恢复..."
+
+echo "=== 3. 等待并验证 ==="
+for i in $(seq 1 15); do
+  sleep 1
+  if /mnt/c/Windows/System32/netstat.exe -ano 2>/dev/null | iconv -f GB18030 -t UTF-8 2>/dev/null | grep "127.0.0.1:${CHECK_PORT}" | grep -q LISTENING; then
+    echo "✅ 端口 ${CHECK_PORT} 已恢复监听 (第 ${i} 秒)"
+    break
+  fi
+done
+
+NEWPID=$("$PS" -NoProfile -Command "$FIND_CMD" 2>/dev/null | tr -d '\r' | grep -E '^[0-9]+$' | head -1)
+echo "新进程 PID=${NEWPID:-未知}"
+echo "=== 完成 ==="

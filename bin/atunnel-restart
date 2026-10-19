@@ -1,47 +1,13 @@
 #!/bin/bash
-# wsl-atrust-restart: 自动重启 Windows 侧 python 转发器
-# 1. 精确查找运行 portmapper.py 的 pythonw 进程
-# 2. 温和终止(无 /F), 不生效则强制 (流程自动化的授权范围内)
-# 3. Start-Process 重新拉起 (独立进程, 不随 WSL 会话退出)
-# 4. 等待端口监听恢复并验证
-# 作者: weiyufei
-
-PS="/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe"
-PYW="C:\\Users\\yfvia\\AppData\\Local\\Programs\\Python\\Python313\\pythonw.exe"
-PM="C:\\Users\\yfvia\\AppData\\Local\\wsl-atrust-portmapper\\portmapper.py"
-CHECK_PORT=${1:-1230}   # 默认验证 1230 端口
-
-FIND_CMD="Get-CimInstance Win32_Process -Filter \"name='pythonw.exe'\" | Where-Object {\$_.CommandLine -like '*portmapper*'} | Select-Object -ExpandProperty ProcessId"
-
-echo "=== 1. 查找运行中的转发器进程 ==="
-PID=$("$PS" -NoProfile -Command "$FIND_CMD" 2>/dev/null | tr -d '\r' | grep -E '^[0-9]+$' | head -1)
-if [ -n "$PID" ]; then
-  echo "找到 PID=$PID, 温和终止 (taskkill 无 /F)..."
-  /mnt/c/Windows/System32/taskkill.exe /PID "$PID" >/dev/null 2>&1
-  sleep 2
-  if /mnt/c/Windows/System32/tasklist.exe 2>/dev/null | iconv -f GB18030 -t UTF-8 2>/dev/null | grep "pythonw.exe" | grep -q "$PID"; then
-    echo "温和终止未生效, 强制终止..."
-    /mnt/c/Windows/System32/taskkill.exe /F /PID "$PID" >/dev/null 2>&1
-    sleep 1
-  fi
-else
-  echo "未找到运行中的转发器 (可能未启动, 直接拉起)"
-fi
-
-echo "=== 2. 重新启动转发器 ==="
-START_CMD="Start-Process -FilePath '$PYW' -ArgumentList '$PM' -WindowStyle Hidden"
-"$PS" -NoProfile -Command "$START_CMD"
-echo "已拉起, 等待端口 ${CHECK_PORT} 监听恢复..."
-
-echo "=== 3. 等待并验证 ==="
-for i in $(seq 1 15); do
-  sleep 1
-  if /mnt/c/Windows/System32/netstat.exe -ano 2>/dev/null | iconv -f GB18030 -t UTF-8 2>/dev/null | grep "127.0.0.1:${CHECK_PORT}" | grep -q LISTENING; then
-    echo "✅ 端口 ${CHECK_PORT} 已恢复监听 (第 ${i} 秒)"
-    break
-  fi
-done
-
-NEWPID=$("$PS" -NoProfile -Command "$FIND_CMD" 2>/dev/null | tr -d '\r' | grep -E '^[0-9]+$' | head -1)
-echo "新进程 PID=${NEWPID:-未知}"
-echo "=== 完成 ==="
+# [v2 已弃用] v1 入口（按目标端口号建映射，会绕过环境清单 → 静默错配风险）
+cat <<'MSG'
+[已弃用] 该命令属于 aTunnel v1（按端口号建映射），v2 起停用，本次未做任何改动。
+请改用清单式流程：
+  1) 编辑 /etc/atunnel/environments.json（唯一事实源；模板见 config/environments.json.example）
+  2) atunnel plan        # 预览变更（退出码 10 = 有待应用变更）
+  3) atunnel apply       # 幂等应用（写 portmapper.json + iptables DNAT/SNAT，并做结构自检）
+  4) atunnel doctor      # 校验（声明地址 / 桥接目标 / 内容指纹 / 结论）
+  5) atunnel ports --check   # 进程端口体检（多项目并行）
+v1 源码保留在 legacy/；接入指引见 docs/env-onboarding.md
+MSG
+exit 1

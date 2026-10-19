@@ -1,97 +1,100 @@
-# aTunnel
+# aTunnel v2
 
-让 WSL 里的应用**零改动透明访问**需要 aTrust 零信任认证的内网服务。
+WSL → aTrust 零信任内网的**透明 TCP 桥接**：WSL 里按内网地址直连，流量经 Windows 侧转发器进隧道。
 
-应用照常连接内网原 IP（如 `172.20.2.15:32279`），aTunnel 自动将其桥接进 aTrust 隧道 —— 全程免管理员、热更新、网络环境自适应。
+> v1（按端口号建映射的 socat 世代）已退役，源码保留在 `legacy/`；迁移见 `docs/migrate-v1-to-v2.md`。
 
 ## 架构
 
 ```
-WSL 应用连 172.20.2.x 原 IP（零改动）
-  → ① iptables DNAT（WSL 内, 透明改写）
-  → ② socat 中转（systemd 自启, 纯回环源发起）
-  → ③ Windows portmapper.py（协议栈内连接 → aTrust 透明劫持 → 隧道）
-  → 内网服务 ✅
+应用(WSL) ──连接内网地址(如 172.20.2.15:58202)
+   │
+   ├─ iptables OUTPUT DNAT: 172.20.2.15:58202 → 127.0.0.1:58212      ← 本机中继端口(local)
+   │  + POSTROUTING SNAT  --to-source 127.0.0.1                     ← mirrored 网络必需
+   ▼
+Windows 转发器 portmapper.py（监听 127.0.0.1:<local>）  ← 3s 热加载 portmapper.json
+   ▼
+aTrust 隧道（Windows 协议栈）──► 内网目标
 ```
 
-**原理**：aTrust 只接管"Windows 协议栈内发起的连接"；WSL 流量走 Hyper-V vSwitch 旁路（镜像模式）进不了协议栈，因此裸连被网关丢弃。aTunnel 让连接"借道 Windows 协议栈"，从而被 aTrust 正常接管。
+**为什么不需要改应用配置**：Redis/PG/SSO 的地址写在远端 Nacos 配置里，应用直接连 → 由 DNAT 在本机"接住"，应用无感。
 
-## 特性
+## 核心概念
 
-- **应用零改动**：应用配置里写内网原 IP 即可
-- **热更新**：增删映射零重启零中断（iptables 增量 + socat 单进程 + portmapper 3 秒热加载）
-- **免管理员**：日常增删查全部免管理员（Windows 侧仅首次部署需一次管理员）
-- **网络自适应**：aTrust 网络下自动桥接，其他网络自动跳过不干扰直连
-- **统一命令**：`atunnel list/add/del/status/restart/log`
+| 概念 | 含义 |
+|---|---|
+| **env** | 一套完整环境（一台主机 + 其 Nacos/Redis/PG/…）。本机可同时存在多套（如 `dev-hydrology`=`.15`、`dev-flood`=`.14`、`shared`=共享设施） |
+| **services** | 桥接层登记：`target`（内网端口）→ `local`（本机中继端口）+ **fingerprint**（内容级身份） |
+| **runtime_ports** | 进程层登记：项目自身服务监听端口（用于多项目并行与冲突检测） |
+| **fingerprint** | 身份指纹：Nacos=`nacos-dataid:<本项目独有 dataId>`、Redis=`redis-runid:<run_id>`、PG=`pg:<inet_server_addr>`；拿不到内容时用 `tcp-only`（显示"未校验"） |
 
-## 部署
+**不变式**（`plan/apply` 前强制校验，违反即拒绝且零变更）：`local` 全局唯一；一个 `(host,target)` 只对应一个 `local`；进程端口在 env 内/跨 env 唯一且不得与 `local` 相同（I5）。
 
-### 前置条件
-
-- WSL 2（镜像网络模式 `networkingMode=mirrored`）
-- aTrust 客户端在线（隧道可用）
-- 目标内网服务需通过 aTrust 认证才能访问
-
-### WSL 侧（root）
+## 安装
 
 ```bash
-cd atunnel
-./install.sh
+# WSL 侧（root）
+sudo ./install.sh [--dry-run] [--with-skill]
+#   装: atunnel-env / atunnel / 兼容命令 / atunnel-env.service(oneshot) / 清单与凭据模板
+#   --with-skill: 同时把 skill/SKILL.md 同步到 ~/.pi/agent/skills/atunnel/（全局生效）
+
+# Windows 侧（一次）
+#   复制 windows/ 到 %LOCALAPPDATA%\wsl-atrust-portmapper\
+#   python portmapper.py --install    # 加入登录自启（免管理员）
+#   python portmapper.py --status     # 配置/日志/监听状态
 ```
 
-### Windows 侧（首次需管理员一次）
-
-1. 复制 `windows/` 目录到 `C:\Users\<user>\AppData\Local\wsl-atrust-portmapper\`
-2. 按需修改 `portmapper.json`（映射清单）
-3. 启动：`pythonw.exe portmapper.py`（或放入启动文件夹实现开机自启）
+从 v1 升级：`sudo scripts/migrate-v1-to-v2.sh --yes`（幂等，自动备份，`doctor` 不过则中止）。
 
 ## 使用
 
 ```bash
-atunnel list                    # 查看所有映射（状态/连通性）
-atunnel add <IP> <端口> [名称]  # 一键热新增映射
-atunnel del <IP> <端口>         # 一键热删除映射
-atunnel status                  # 整体状态（aTrust在线/IP/服务/规则）
-atunnel restart [端口]          # 重启 Windows 转发器
-atunnel log [行数]              # 查看转发器日志
+atunnel --version                 # 版本
+atunnel status                    # aTrust 网卡 / 本机 IP / 单元状态 / 清单摘要
+atunnel list                      # 清单端点
+atunnel plan                      # 只读预览（退出码 10 = 有待应用变更）
+atunnel apply                     # 幂等应用（写 portmapper.json + iptables，并做结构自检）
+atunnel verify <env>              # 身份校验（逐条指纹，指出串到哪个 env）
+atunnel doctor [env]              # 对照表：声明地址 / 桥接实际目标 / 指纹 / 结论
+atunnel ports [--check]           # 进程端口表 / 冲突体检（同 env、跨 env、与 local 冲突）
+atunnel preflight <env> --role R  # 启动脚本用：数据面同源 + 该角色端口空闲
+atunnel selftest                  # 校验层自检（纯内存）
+atunnel log [n]                   # Windows 转发器日志
 ```
 
-### 新增映射的完整链路（一条命令）
+> `atunnel add|del|restart` 属 v1，**已停用**（打印指引并 exit 1）。新增/修改映射一律：**改清单 → `plan` → `apply` → `doctor`**。
 
-```bash
-atunnel add 172.20.2.16 8080 新服务
-```
+## 端口段约定（多项目并行）
 
-自动完成：端口冲突检查 → WSL 增量热添加（iptables+socat）→ Windows portmapper.json 更新（3 秒热加载）→ 链路验证。
+| 项目 | 业务服务 | 网关 | 前端 |
+|---|---|---|---|
+| 例：项目 A | 9200-9299 | 18080 | 80 |
+| 例：项目 B | 9300-9399 | 8080 | 8082 |
 
-## 配置文件
-
-| 文件 | 位置 | 说明 |
-|---|---|---|
-| `config/wsl-atrust-forward.conf.example` | `/etc/wsl-atrust-forward.conf` | WSL 侧映射清单（目标IP 端口 socat端口） |
-| `windows/portmapper.json.example` | Windows 转发器目录 | Windows 侧映射清单 |
-
-两处配置保持同步（`atunnel add/del` 自动维护）。
+新项目接入：**取一段空闲端口段** → 登记 env → `atunnel plan/apply/doctor` → 脚本加 `preflight --role` → 写项目文档。完整 SOP 见 `docs/env-onboarding.md`。
+服务的 `server.port` 若来自 `bootstrap.yml`，优先用启动脚本 `-Dserver.port=<段内端口>` 覆盖（实测有效，**无需改仓库、无需重编 jar**）。
 
 ## 限制
 
-- 仅支持 TCP
-- 依赖 aTrust 客户端在线
-- 依赖 Windows 转发器进程运行（开机自启已配置）
+- 仅 TCP；依赖 aTrust 客户端在线、Windows 转发器常驻；
+- Windows 转发器按 `listen`（本地端口）索引 → **同一本地端口只能有一个目标**：多环境同端口号时必须各自分配不同 `local`（v2 清单强制，`atunnel ports --check` 兜底）；
+- `iptables` 规则不持久 → 由 `atunnel-env.service`（oneshot）开机重放。
 
-## 文件结构
+## 目录结构
 
 ```
-bin/                    # 命令行工具
-  atunnel               主命令
-  atunnel-add           一键热新增
-  atunnel-del           一键热删除
-  atunnel-restart       Windows 转发器重启
-  atunnel-forward.sh    WSL 侧 DNAT+socat 管理
-windows/                # Windows 侧组件
-  portmapper.py         热加载转发器
-  portmapper.json.example
-config/                 # 配置模板
-systemd/                # WSL 自启服务
-skill/                  # agent 技能（自动判断是否加入桥接）
+bin/atunnel             CLI（薄封装、含 v1 弃用 stub）
+bin/atunnel-env         核心（清单驱动：plan/apply/verify/doctor/ports/preflight/selftest）
+config/*.example        清单与凭据模板
+systemd/                atunnel-env.service（oneshot）
+windows/                portmapper.py（转发器；--install/--status/日志轮转）
+docs/                   接入 SOP、v1→v2 迁移说明
+scripts/                migrate-v1-to-v2.sh
+legacy/                 v1 退役件（源码保留 + 退役说明）
+VERSION                 版本
 ```
+
+## 版本
+
+- **2.0.0**（2026-10）：清单驱动 + 内容级身份指纹 + 多环境/多项目并存 + 进程端口体检 + v1 退役 + Windows 侧纳管
+- 1.x：socat + 按端口号建映射（已退役，见 `legacy/`）

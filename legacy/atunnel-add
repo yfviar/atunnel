@@ -1,0 +1,54 @@
+#!/bin/bash
+# wsl-atrust-add: 一键热新增 aTrust 内网访问映射 (零重启零中断)
+# 用法: wsl-atrust-add <目标IP> <目标端口> [名称]
+# 自动: 1.端口冲突检查 2.WSL 增量热添加(iptables -A + 新 socat, 不动现有连接)
+#       3.更新 Windows portmapper.json (转发器每3秒热加载, 自动监听新端口)
+#       4.链路验证
+# 作者: weiyufei
+
+WSL_CONF=/etc/wsl-atrust-forward.conf
+WIN_JSON="/mnt/c/Users/yfvia/AppData/Local/wsl-atrust-portmapper/portmapper.json"
+
+usage() {
+  echo "用法: $0 <目标IP> <目标端口> [名称]"
+  echo "示例: $0 172.20.2.16 8080 新服务"
+  exit 1
+}
+
+[ $# -lt 2 ] && usage
+TARGET_IP=$1
+TARGET_PORT=$2
+NAME=${3:-"svc-$TARGET_PORT"}
+SOCAT_PORT=$((TARGET_PORT + 1))
+
+echo "=== 1. 端口冲突检查 ==="
+grep -qE "^${TARGET_IP} ${TARGET_PORT} " "$WSL_CONF" 2>/dev/null && { echo "❌ WSL 配置中已存在 ${TARGET_IP}:${TARGET_PORT}"; exit 1; }
+grep -qE "\"listen\": ${TARGET_PORT}," "$WIN_JSON" 2>/dev/null && { echo "❌ portmapper.json 已存在 listen=${TARGET_PORT}"; exit 1; }
+ss -tln 2>/dev/null | grep -q ":${SOCAT_PORT} " && { echo "❌ WSL 本机端口 ${SOCAT_PORT} 已被占用"; exit 1; }
+echo "✅ 端口检查通过 (目标=${TARGET_PORT}, socat=${SOCAT_PORT})"
+
+echo "=== 2. WSL 增量热添加 (零中断) ==="
+/usr/local/bin/atunnel-forward.sh add "$TARGET_IP" "$TARGET_PORT" "$SOCAT_PORT" || exit 1
+echo "${TARGET_IP} ${TARGET_PORT} ${SOCAT_PORT}" >> "$WSL_CONF"
+echo "✅ 配置已持久化到 $WSL_CONF"
+
+echo "=== 3. 更新 Windows portmapper.json (热加载自动生效) ==="
+if [ -f "$WIN_JSON" ]; then
+  python3 - "$WIN_JSON" "$TARGET_IP" "$TARGET_PORT" "$NAME" <<'EOF'
+import json, sys
+path, ip, port, name = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4]
+with open(path, encoding='utf-8') as f:
+    data = json.load(f)
+data.append({"listen": port, "target_host": ip, "target_port": port, "name": name})
+with open(path, 'w', encoding='utf-8') as f:
+    json.dump(data, f, ensure_ascii=False, indent=2)
+EOF
+  echo "✅ 已写入, 等待转发器热加载 (3秒)..."
+  sleep 4
+else
+  echo "⚠️ 未找到 $WIN_JSON"
+fi
+
+echo "=== 4. 链路验证 ==="
+timeout 6 nc -zv "$TARGET_IP" "$TARGET_PORT" 2>&1 | head -1
+echo "=== 完成! 全程零重启零中断 ==="

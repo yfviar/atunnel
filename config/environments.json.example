@@ -1,0 +1,40 @@
+{
+  "version": 2,
+  "note": "aTunnel 环境清单（唯一事实源）。services = 内网端点 → 本机中继端口(local) + 内容指纹；runtime_ports = 项目自身服务监听端口。local 与 runtime_ports 语义不同，都要登记。",
+  "port_bands": {
+    "dev-A": "9200-9299 / gateway 18080 / ui 80",
+    "dev-B": "9300-9399 / gateway 8080 / ui 8082"
+  },
+  "envs": {
+    "dev-A": {
+      "host": "172.20.2.15",
+      "owner": "<项目A>",
+      "services": {
+        "nacos":        { "target": 58204, "local": 58214, "fingerprint": "nacos-dataid:<本项目独有 dataId>.yml" },
+        "nacos-grpc":   { "target": 59204, "local": 59214 },
+        "redis":        { "target": 58202, "local": 58212, "fingerprint": "redis-runid:<期望 run_id 前12位>" },
+        "pg":           { "target": 58201, "local": 58211, "fingerprint": "pg:<inet_server_addr>" },
+        "wuguan-redis": { "target": 32279, "local": 32279, "fingerprint": "tcp-only" }
+      },
+      "runtime_ports": { "auth": 9200, "system": 9201, "business": 9206, "gateway": 18080, "frontend": 80 }
+    },
+    "dev-B": {
+      "host": "172.20.2.14",
+      "owner": "<项目B>",
+      "services": {
+        "nacos": { "target": 58204, "local": 58204, "fingerprint": "nacos-dataid:<项目B独有 dataId>.yml" },
+        "redis": { "target": 58202, "local": 58202, "fingerprint": "redis-runid:<期望 run_id>" },
+        "pg":    { "target": 58201, "local": 58201, "fingerprint": "pg:<inet_server_addr>" }
+      },
+      "runtime_ports": { "auth": 9300, "system": 9301, "business": 9306, "gateway": 8080, "frontend": 8082 }
+    },
+    "shared": {
+      "owner": "shared",
+      "note": "跨环境共享设施；按服务指定 host",
+      "services": {
+        "sso":   { "host": "172.20.2.14", "target": 8068,  "local": 8068,  "fingerprint": "tcp-only" },
+        "nexus": { "host": "172.20.2.11", "target": 8081,  "local": 8081,  "fingerprint": "tcp-only" }
+      }
+    }
+  }
+}

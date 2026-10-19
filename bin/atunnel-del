@@ -1,46 +1,13 @@
 #!/bin/bash
-# wsl-atrust-del: 一键热删除 aTrust 内网访问映射 (零重启零中断)
-# 用法: wsl-atrust-del <目标IP> <目标端口>
-# 自动: 1.WSL 热删除(DNAT+socat, 不动其他连接) 2.Windows portmapper.json 删除(转发器3秒热关闭)
-# 作者: weiyufei
-
-WSL_CONF=/etc/wsl-atrust-forward.conf
-WIN_JSON="/mnt/c/Users/yfvia/AppData/Local/wsl-atrust-portmapper/portmapper.json"
-
-usage() {
-  echo "用法: $0 <目标IP> <目标端口>"
-  echo "示例: $0 172.20.2.16 8080"
-  exit 1
-}
-
-[ $# -lt 2 ] && usage
-TARGET_IP=$1
-TARGET_PORT=$2
-
-# 从 WSL 配置读取该映射的 socat 端口
-SOCAT_PORT=$((TARGET_PORT + 1))
-CONF_LINE=$(grep -E "^${TARGET_IP} ${TARGET_PORT} " "$WSL_CONF" 2>/dev/null | head -1)
-[ -n "$CONF_LINE" ] && SOCAT_PORT=$(echo "$CONF_LINE" | awk '{print $3}')
-
-echo "=== 1. WSL 热删除 ==="
-/usr/local/bin/atunnel-forward.sh del "$TARGET_IP" "$TARGET_PORT" "$SOCAT_PORT"
-sed -i "/^${TARGET_IP} ${TARGET_PORT} /d" "$WSL_CONF"
-echo "✅ 已从 $WSL_CONF 移除"
-
-echo "=== 2. Windows 热删除 (转发器自动关闭监听) ==="
-python3 - "$WIN_JSON" "$TARGET_IP" "$TARGET_PORT" <<'EOF'
-import json, sys
-path, ip, port = sys.argv[1], sys.argv[2], int(sys.argv[3])
-with open(path, encoding='utf-8') as f:
-    data = json.load(f)
-before = len(data)
-data = [m for m in data if not (m.get("target_host") == ip and m.get("target_port") == port)]
-with open(path, 'w', encoding='utf-8') as f:
-    json.dump(data, f, ensure_ascii=False, indent=2)
-print("✅ portmapper.json 已更新 (%d -> %d 项)" % (before, len(data)))
-EOF
-
-echo "=== 3. 等待热加载并验证 ==="
-sleep 4
-ss -tln 2>/dev/null | grep -q ":${SOCAT_PORT} " && echo "⚠️ socat 仍监听" || echo "✅ WSL socat 已停止"
-echo "=== 完成! ==="
+# [v2 已弃用] v1 入口（按目标端口号建映射，会绕过环境清单 → 静默错配风险）
+cat <<'MSG'
+[已弃用] 该命令属于 aTunnel v1（按端口号建映射），v2 起停用，本次未做任何改动。
+请改用清单式流程：
+  1) 编辑 /etc/atunnel/environments.json（唯一事实源；模板见 config/environments.json.example）
+  2) atunnel plan        # 预览变更（退出码 10 = 有待应用变更）
+  3) atunnel apply       # 幂等应用（写 portmapper.json + iptables DNAT/SNAT，并做结构自检）
+  4) atunnel doctor      # 校验（声明地址 / 桥接目标 / 内容指纹 / 结论）
+  5) atunnel ports --check   # 进程端口体检（多项目并行）
+v1 源码保留在 legacy/；接入指引见 docs/env-onboarding.md
+MSG
+exit 1

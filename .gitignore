@@ -1,2 +1,5 @@
 *.log
 portmapper.json
+
+__pycache__/
+*.pyc

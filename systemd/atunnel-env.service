@@ -1,0 +1,16 @@
+[Unit]
+Description=aTunnel env bridge reconcile (declarative; oneshot, idempotent)
+Documentation=file:/etc/atunnel/environments.json
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/atunnel-env apply
+RemainAfterExit=yes
+TimeoutStartSec=180
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

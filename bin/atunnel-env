@@ -1,0 +1,714 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""atunnel-env — aTunnel 多环境桥接清单与校验层
+
+唯一事实源 : /etc/atunnel/environments.json
+读凭据     : /etc/atunnel/credentials.conf (ATUNNEL_NACOS_USER/PASS, 0600, 可被同名环境变量覆盖)
+备份/状态  : /etc/atunnel/backup/ , /etc/atunnel/state.json
+
+用法: atunnel-env {list|show|plan|apply|verify|fingerprint|preflight|doctor|selftest} [env] [--prune] [--force]
+退出码: 0=一致  10=有变更待 apply(plan)  1=失败/不一致/未知 env
+"""
+import json, os, re, socket, subprocess, sys, time, shutil
+
+VERSION = "2.0.0"
+MAN = os.environ.get("ATUNNEL_MAN", "/etc/atunnel/environments.json")
+CREDS = os.environ.get("ATUNNEL_CREDS", "/etc/atunnel/credentials.conf")
+STATE = os.environ.get("ATUNNEL_STATE", "/etc/atunnel/state.json")
+BACKUP = os.environ.get("ATUNNEL_BACKUP", "/etc/atunnel/backup")
+
+def _detect_win_json():
+    """自动探测 Windows 侧 portmapper.json（可用 ATUNNEL_WIN_JSON 覆盖）"""
+    env = os.environ.get("ATUNNEL_WIN_JSON")
+    if env: return env
+    import glob
+    cands = sorted(glob.glob("/mnt/c/Users/*/AppData/Local/wsl-atrust-portmapper/portmapper.json"))
+    return cands[0] if cands else "/mnt/c/Users/<user>/AppData/Local/wsl-atrust-portmapper/portmapper.json"
+
+WIN_JSON = _detect_win_json()
+IPT = shutil.which("iptables") or "/usr/sbin/iptables"
+IPT_SAVE = shutil.which("iptables-save") or "/usr/sbin/iptables-save"
+DEFAULT_TENANT = "weiyufei"
+FP2ENV = {}          # 指纹 → env 名
+PASS, FAIL, WARN, DIM, NC = "\033[0;32m", "\033[0;31m", "\033[1;33m", "\033[2m", "\033[0m"
+_REQUIRE_FP = ("nacos", "redis", "pg")   # 这几类必须有内容指纹（I3）
+
+def sh(cmd, timeout=20):
+    try:
+        r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout)
+        return r.returncode, r.stdout, r.stderr
+    except Exception as e:
+        return 1, "", str(e)
+
+# ---------------- manifest / creds ----------------
+def load_manifest():
+    with open(MAN, encoding="utf-8") as f:
+        return json.load(f)
+
+def load_creds():
+    u = os.environ.get("ATUNNEL_NACOS_USER"); p = os.environ.get("ATUNNEL_NACOS_PASS")
+    if u and p: return u, p
+    if os.path.exists(CREDS):
+        for line in open(CREDS, encoding="utf-8"):
+            line = line.strip()
+            if line.startswith("ATUNNEL_NACOS_USER="): u = line.split("=", 1)[1].strip().strip("'\"")
+            if line.startswith("ATUNNEL_NACOS_PASS="): p = line.split("=", 1)[1].strip().strip("'\"")
+    return u, p
+
+def services(man, env=None):
+    out = []
+    for e, d in man["envs"].items():
+        if env and e != env: continue
+        for s, c in d["services"].items():
+            out.append({"env": e, "svc": s, "host": c.get("host", d.get("host")), "target": c["target"],
+                        "local": c["local"], "fp": c.get("fingerprint"), "tenant": d.get("config_tenant", DEFAULT_TENANT),
+                        "optional": bool(c.get("optional"))})
+    return out
+
+def env_runtime_ports(man, env=None):
+    out = []
+    for e, d in man["envs"].items():
+        if env and e != env: continue
+        for role, port in (d.get("runtime_ports") or {}).items():
+            out.append({"env": e, "role": role, "port": int(port)})
+    return out
+
+def listening_ports():
+    rc, out, _ = sh("ss -ltn")
+    ports = set()
+    for line in out.splitlines()[1:]:
+        f = line.split()
+        if len(f) >= 4 and ":" in f[3]:
+            try: ports.add(int(f[3].rsplit(":", 1)[1]))
+            except ValueError: pass
+    return ports
+
+def port_owner(port):
+    rc, out, _ = sh(f"ss -ltnp 2>/dev/null | grep ':{port} '")
+    m = re.search(r'users:\(\("([^"]+)",pid=(\d+)', out)
+    return f'{m.group(1)}(pid={m.group(2)})' if m else "未知进程（可能属 Windows 侧）"
+
+def pm_load():
+    with open(WIN_JSON, encoding="utf-8") as f: return json.load(f)
+
+def validate(man):
+    """I1 唯一性 / I2 本机端口占用 / I3 指纹必填。返回错误列表（非空即拒绝一切写操作）。"""
+    errs, loc, tgt = [], {}, {}
+    for e, d in man["envs"].items():
+        for s, c in d["services"].items():
+            host = c.get("host", d.get("host"))
+            L, k = c["local"], (host, c["target"])
+            loc.setdefault(L, set()).add(k)
+            tgt.setdefault(k, set()).add(L)
+            if not (1024 <= L <= 65535): errs.append(f"[I2] {e}/{s} local={L} 不在 1024-65535")
+            if s in _REQUIRE_FP and not c.get("fingerprint"):   # nacos-grpc 等按设计为 tcp-only
+                errs.append(f"[I3] {e}/{s} 关键服务缺少 fingerprint")
+    for L, ks in loc.items():
+        if len(ks) > 1: errs.append(f"[I1] local 端口 {L} 被多个目标占用: {sorted(ks)}")
+    for k, Ls in tgt.items():
+        if len(Ls) > 1: errs.append(f"[I1] 目标 {k} 映射到多个 local: {sorted(Ls)}")
+    # I5：进程端口（runtime_ports）—— 跨 env / 同 env 内 / 与桥接 local 均不得冲突
+    seen5, per5 = {}, {}
+    for r in env_runtime_ports(man):
+        seen5.setdefault(r["port"], []).append(f'{r["env"]}/{r["role"]}')
+        per5.setdefault((r["env"], r["port"]), []).append(r["role"])
+    for port, owners in seen5.items():
+        envs = {o.split("/")[0] for o in owners}
+        if len(envs) > 1: errs.append(f"[I5] 进程端口 {port} 被多个 env 声明: {sorted(owners)}")
+    for (e, port), roles in per5.items():
+        if len(roles) > 1: errs.append(f"[I5] {e} 内部端口 {port} 被多个角色声明: {sorted(roles)}")
+    bridge_local = {c["local"] for d in man["envs"].values() for c in d["services"].values()}
+    for r in env_runtime_ports(man):
+        if r["port"] in bridge_local:
+            errs.append(f"[I5] {r['env']}/{r['role']} 进程端口 {r['port']} 与桥接 local 端口冲突")
+    # I2：本机端口若已被 portmapper 的"别的目标"占用 → 冲突
+    try:
+        for e0 in pm_load():
+            L, k = int(e0["listen"]), (e0["target_host"], int(e0["target_port"]))
+            if L in loc and k not in loc[L]:
+                errs.append(f"[I2] local {L} 已被 portmapper 的 {k[0]}:{k[1]} 占用（与本清单目标 {sorted(loc[L])} 冲突）")
+    except Exception:
+        pass
+    return errs
+
+# ---------------- portmapper ----------------
+def pm_plan(man, env=None, prune=False):
+    cur, ch = pm_load(), []
+    managed = {}
+    for s in services(man, env):
+        hit = [e for e in cur if e.get("target_host") == s["host"] and int(e.get("target_port")) == s["target"]]
+        if not hit:
+            ch.append(("add", s, None)); managed[s["svc"]] = s; continue
+        e = hit[0]
+        owner = (e.get("name") or "")
+        mine = owner.startswith(f'{s["env"]}/') or owner == f'{s["env"]}/{s["svc"]}'
+        if len(hit) > 1:
+            ch.append(("dedupe", s, hit))
+        elif int(e["listen"]) != s["local"]:
+            ch.append(("update", s, e) if mine or not owner else ("CONFLICT", s, e))
+        elif not owner:
+            ch.append(("rename", s, e))
+        managed[s["svc"]] = s
+    if prune:
+        keep = {(s["host"], s["target"]) for s in services(man)}
+        for e in cur:
+            if (e.get("target_host"), int(e.get("target_port"))) not in keep:
+                ch.append(("delete-stale", {"env": "stale", "svc": e.get("name", "?"), "host": e["target_host"],
+                                            "target": int(e["target_port"]), "local": int(e["listen"])}, None))
+    return ch
+
+def backup(path, name, save=False):
+    os.makedirs(BACKUP, exist_ok=True)
+    dst = os.path.join(BACKUP, f"{name}.{time.strftime('%Y%m%d-%H%M%S')}.bak")
+    if save:
+        rc, _, err = sh(f"{IPT_SAVE} > {dst}")
+        if rc != 0: raise RuntimeError(f"iptables-save 备份失败: {err[:80]}")
+    else:
+        shutil.copy2(path, dst)
+    return dst
+
+def load_state():
+    try:
+        with open(STATE, encoding="utf-8") as f: return json.load(f)
+    except Exception: return {}
+
+def save_state(st):
+    os.makedirs(os.path.dirname(STATE), exist_ok=True)
+    with open(STATE, "w", encoding="utf-8") as f: json.dump(st, f, ensure_ascii=False, indent=2)
+
+def pm_apply(man, env=None, prune=False, dry=True):
+    ch = pm_plan(man, env, prune)
+    conflict = [c for c in ch if c[0] == "CONFLICT"]
+    if conflict:
+        for _, s, e in conflict:
+            print(FAIL + f"  [portmapper] 冲突: listen {e['listen']} 属于 {e.get('name')}，拒绝改写（如需接管用 --force）" + NC)
+        return ch
+    if dry: return ch
+    cur = pm_load()
+    if ch:
+        backup(WIN_JSON, "portmapper.json")
+        for act, s, e in ch:
+            if act in ("add", "update", "rename", "dedupe"):
+                hit = [x for x in cur if x.get("target_host") == s["host"] and int(x.get("target_port")) == s["target"]]
+                if hit:
+                    hit[0]["listen"] = s["local"]; hit[0]["name"] = f'{s["env"]}/{s["svc"]}'
+                    for x in hit[1:]: cur.remove(x)
+                else:
+                    cur.append({"listen": s["local"], "target_host": s["host"], "target_port": s["target"],
+                                "name": f'{s["env"]}/{s["svc"]}'})
+            elif act == "delete-stale":
+                for x in list(cur):
+                    if x.get("target_host") == s["host"] and int(x.get("target_port")) == s["target"]: cur.remove(x)
+        with open(WIN_JSON, "w", encoding="utf-8") as f:
+            json.dump(cur, f, ensure_ascii=False, indent=2)
+    # state 记录"应纳管全集"（供 I4 漂移告警与 --prune 参考）
+    st = load_state()
+    st["managed"] = [{"env": s["env"], "svc": s["svc"], "host": s["host"], "target": s["target"], "local": s["local"]}
+                     for s in services(man)]
+    save_state(st)
+    return ch
+
+# ---------------- iptables ----------------
+# 宽松解析：不要求参数顺序/是否带 -m tcp 等；只按语义抽取关键字段
+def nat_rules(chain=None):
+    _, out, _ = sh(f"{IPT} -t nat -S")
+    rules = []
+    for line in out.splitlines():
+        line = line.strip()
+        if not line.startswith("-A "): continue
+        ch = line.split()[1]
+        if chain and ch != chain: continue
+        m_d = re.search(r"(?:^|\s)-d (\S+)", line)
+        m_p = re.search(r"--dport (\d+)", line) or re.search(r"(?:^|\s)--dport (\d+)", line)
+        m_j = re.search(r"-j (DNAT|SNAT|REDIRECT)", line)
+        if not (m_d and m_p and m_j): continue
+        m_to = re.search(r"--to-destination (\S+):(\d+)", line)
+        m_src = re.search(r"--to-source (\S+)", line)
+        rules.append({"chain": ch, "raw": line[len(f"-A {ch} "):], "dst": m_d.group(1).replace("/32", ""),
+                      "dport": int(m_p.group(1)), "jump": m_j.group(1),
+                      "to_ip": m_to.group(1) if m_to else None, "to_port": int(m_to.group(2)) if m_to else None,
+                      "to_src": m_src.group(1) if m_src else None})
+    return rules
+
+def effective_dnat(host, target):
+    hits = [r for r in nat_rules("OUTPUT") if r["dst"] == host and r["dport"] == target and r["jump"] in ("DNAT", "REDIRECT")]
+    return (hits[0] if hits else None), hits
+
+def need_snat(local, src="127.0.0.1"):
+    return not any(r["dst"] == "127.0.0.1" and r["dport"] == local and r["jump"] == "SNAT" and r["to_src"] == src
+                   for r in nat_rules("POSTROUTING"))
+
+def ipt_plan(man, env=None, prune=False):
+    ch = []
+    for s in services(man, env):
+        first, hits = effective_dnat(s["host"], s["target"])
+        if not hits: ch.append(("dnat-add", s, None))
+        elif len(hits) > 1: ch.append(("dnat-dedupe", s, hits))
+        elif first["to_ip"] != "127.0.0.1" or first["to_port"] != s["local"]: ch.append(("dnat-fix", s, first))
+        if need_snat(s["local"]): ch.append(("snat-add", s, None))
+    if prune:
+        known = {(s["host"], s["target"]) for s in services(man)}
+        known_locals = {s["local"] for s in services(man)}
+        for r in nat_rules("OUTPUT"):
+            if r["jump"] == "DNAT" and r["to_ip"] == "127.0.0.1" and (r["dst"], r["dport"]) not in known:
+                ch.append(("dnat-stale", {"env": "stale", "svc": f'{r["dst"]}:{r["dport"]}',
+                                          "host": r["dst"], "target": r["dport"], "local": r["to_port"]}, r))
+        for r in nat_rules("POSTROUTING"):
+            if r["jump"] == "SNAT" and r["dst"] == "127.0.0.1" and r["dport"] not in known_locals:
+                ch.append(("snat-stale", {"env": "stale", "svc": f'local:{r["dport"]}',
+                                          "host": "127.0.0.1", "target": r["dport"], "local": r["dport"]}, r))
+    return ch
+
+def ipt_apply(man, env=None, prune=False, dry=True):
+    ch = ipt_plan(man, env, prune)
+    if dry or not ch: return ch, []
+    backup(None, "iptables-nat", save=True)
+    errs = []
+    for act, s, extra in ch:
+        if act in ("dnat-add", "dnat-fix", "dnat-dedupe"):
+            hits = [r for r in nat_rules("OUTPUT") if r["dst"] == s["host"] and r["dport"] == s["target"]]
+            for r in hits:
+                rc, _, e = sh(f"{IPT} -t nat -D OUTPUT {r['raw']}")
+                if rc != 0: errs.append(f"删除 DNAT 失败 {s['host']}:{s['target']} -> {e[:60]}")
+            rc, _, e = sh(f"{IPT} -t nat -A OUTPUT -d {s['host']} -p tcp --dport {s['target']} -j DNAT --to-destination 127.0.0.1:{s['local']}")
+            if rc != 0: errs.append(f"添加 DNAT 失败 {s['host']}:{s['target']} -> {e[:60]}")
+        elif act == "dnat-stale":
+            rc, _, e = sh(f"{IPT} -t nat -D OUTPUT {extra['raw']}")
+            if rc != 0: errs.append(f"清理残留 DNAT 失败 {extra['raw'][:60]}")
+        elif act == "snat-stale":
+            rc, _, e = sh(f"{IPT} -t nat -D POSTROUTING {extra['raw']}")
+            if rc != 0: errs.append(f"清理残留 SNAT 失败 {extra['raw'][:60]}")
+        elif act == "snat-add":
+            for r in [r for r in nat_rules("POSTROUTING") if r["dst"] == "127.0.0.1" and r["dport"] == s["local"] and r["jump"] == "SNAT"]:
+                sh(f"{IPT} -t nat -D POSTROUTING {r['raw']}")
+            rc, _, e = sh(f"{IPT} -t nat -A POSTROUTING -d 127.0.0.1 -p tcp --dport {s['local']} -j SNAT --to-source 127.0.0.1")
+            if rc != 0: errs.append(f"添加 SNAT 失败 local {s['local']} -> {e[:60]}")
+    return ch, errs
+
+def structural_check(man, env=None):
+    """apply 后自检：首命中目标必须等于清单 local，且 SNAT 在位。"""
+    probs = []
+    for s in services(man, env):
+        first, hits = effective_dnat(s["host"], s["target"])
+        if not first:
+            probs.append(f'{s["env"]}/{s["svc"]}: 无 DNAT 规则')
+        elif first["to_ip"] != "127.0.0.1" or first["to_port"] != s["local"]:
+            probs.append(f'{s["env"]}/{s["svc"]}: 首命中 {first["to_ip"]}:{first["to_port"]} ≠ 期望 127.0.0.1:{s["local"]}')
+        elif len(hits) > 1:
+            probs.append(f'{s["env"]}/{s["svc"]}: 存在 {len(hits)} 条重复 DNAT')
+        if need_snat(s["local"]): probs.append(f'{s["env"]}/{s["svc"]}: 缺 SNAT(local {s["local"]})')
+    return probs
+
+def wait_hot_reload(locals_, timeout=12):
+    t0 = time.time(); todo = list(locals_)
+    while todo and time.time() - t0 < timeout:
+        todo = [p for p in todo if not tcp_ok("127.0.0.1", p, 1.5)]
+        if todo: time.sleep(1)
+    return todo
+
+# ---------------- fingerprints ----------------
+def tcp_ok(host, port, to=4):
+    try:
+        s = socket.create_connection((host, port), timeout=to); s.close(); return True
+    except Exception: return False
+
+def nacos_cfg(host, port, dataid, tenant, u, p):
+    rc, body, _ = sh(f"curl -s -G 'http://{host}:{port}/nacos/v1/cs/configs' "
+                     f"--data-urlencode 'dataId={dataid}' --data-urlencode 'group=DEFAULT_GROUP' "
+                     f"--data-urlencode 'tenant={tenant}' --data-urlencode 'username={u}' --data-urlencode 'password={p}'")
+    return body
+
+_cache = {}
+def redis_pw(env, host, tenant, u, p):
+    if ("rpw", env) in _cache: return _cache[("rpw", env)]
+    pw = os.environ.get("ATUNNEL_REDIS_PASS")
+    if not pw:
+        body = nacos_cfg(host, 58204, "zhy-gateway-dev.yml", tenant, u, p)
+        m = re.search(r"redis:\s*$(.*?)^\S", body, re.S | re.M)
+        seg = m.group(1) if m else body
+        m2 = re.search(r"^\s*password:\s*(\S+)", seg, re.M)
+        pw = m2.group(1) if m2 else None
+    _cache[("rpw", env)] = pw
+    return pw
+
+def pg_cred(env, host, tenant, u, p):
+    """从该 env 的 zhy-system-dev.yml 里解析 PG 连接信息（仅内存，不落盘）"""
+    if ("pg", env) in _cache: return _cache[("pg", env)]
+    body = nacos_cfg(host, 58204, "zhy-system-dev.yml", tenant, u, p)
+    m = re.search(r"jdbc:postgresql://([\d.]+):(\d+)/(\w+)", body)
+    if not m:
+        _cache[("pg", env)] = None; return None
+    tail = body[m.end():m.end() + 800]
+    us = re.search(r"^\s*username:\s*(\S+)", tail, re.M)
+    pw = re.search(r"^\s*password:\s*(\S+)", tail, re.M)
+    val = (m.group(1), int(m.group(2)), m.group(3), us.group(1) if us else None, pw.group(1) if pw else None)
+    _cache[("pg", env)] = val
+    return val
+
+def _redis_run_id(host, port, pw, timeout=6):
+    try:
+        sock = socket.create_connection((host, port), timeout=timeout)
+        if pw:
+            sock.sendall(f"AUTH {pw}\r\n".encode()); time.sleep(0.25); sock.recv(4096)
+        sock.sendall(b"INFO server\r\n"); time.sleep(0.25)
+        r = sock.recv(65535).decode(errors="ignore"); sock.close()
+        m = re.search(r"run_id:([0-9a-f]+)", r)
+        return m.group(1)[:12] if m else None
+    except Exception:
+        return None
+
+def _pg_addr(s, u, p):
+    try:
+        import psycopg2
+    except Exception:
+        return None
+    cred = pg_cred(s["env"], s["host"], s["tenant"], u, p)
+    if not cred or not cred[3] or not cred[4]: return None
+    _, port, db, us, pw = cred
+    try:
+        c = psycopg2.connect(host=s["host"], port=s["target"], dbname=db, user=us, password=pw, connect_timeout=6)
+        cur = c.cursor(); cur.execute("select inet_server_addr()::text"); addr = (cur.fetchone() or [None])[0]; c.close()
+        return (addr or "").split("/")[0] or None
+    except Exception:
+        return None
+
+def fp_nacos(s, all_ids, u, p):
+    mine = s["fp"].split(":", 1)[1]
+    ours = nacos_cfg(s["host"], s["target"], mine, s["tenant"], u, p)
+    if len(ours) > 40:
+        return True, f"{mine} 存在({len(ours.encode())}B)", None
+    for other_fp, oid in all_ids:
+        if other_fp == s["fp"]: continue
+        body = nacos_cfg(s["host"], s["target"], oid, s["tenant"], u, p)
+        if len(body) > 40:
+            return False, f"本 env 的 dataId 不存在，但存在 {oid}({len(body.encode())}B)", FP2ENV.get(other_fp, other_fp)
+    return False, f"{mine} 不存在/拉取失败", None
+
+def fp_redis(s, all_fps, u, p, man=None):
+    pw = redis_pw(s["env"], s["host"], s["tenant"], u, p)
+    rid = _redis_run_id(s["host"], s["target"], pw)
+    if not rid: return "fail", "连接失败/无 run_id（未授权或不可达）", None
+    exp = (s["fp"] or ":").split(":", 1)[1] if s["fp"] else None
+    if exp and rid == exp: return "ok", f"run_id={rid}", None
+    # 真串台判定：本端实测值 == 另一个 env 的"现场实测值"
+    if man:
+        for o in services(man):
+            if o["env"] == s["env"] or o["svc"] != s["svc"]: continue
+            opw = redis_pw(o["env"], o["host"], o["tenant"], u, p)
+            if _redis_run_id(o["host"], o["target"], opw) == rid:
+                return "fail", f"run_id={rid}", o["env"]
+    return "warn", f"run_id={rid} ≠ 清单记录 {exp}（实例已重启，建议 atunnel refresh {s['env']}）", None
+
+def fp_pg(s, u, p, man=None):
+    exp = (s["fp"] or ":").split(":", 1)[1]
+    try:
+        import psycopg2  # noqa: F401
+    except Exception:
+        return "ok", "TCP 可达（未校验：缺 psycopg2）", None
+    addr = _pg_addr(s, u, p)
+    if not addr: return "fail", "PG 连接失败（凭据缺失或不可达）", None
+    if exp and addr == exp: return "ok", f"server_addr={addr}", None
+    if man:
+        for o in services(man):
+            if o["env"] == s["env"] or o["svc"] != s["svc"]: continue
+            if _pg_addr(o, u, p) == addr:
+                return "fail", f"server_addr={addr}", o["env"]
+    return "warn", f"server_addr={addr} ≠ 清单记录 {exp}（实例地址变化，建议 atunnel refresh {s['env']}）", None
+
+def fingerprint(s, all_ids, all_fps, u, p, man=None):
+    if not tcp_ok(s["host"], s["target"]):
+        return "fail", "TCP 不可达", None
+    fp = s["fp"] or ""
+    if fp.startswith("nacos-dataid:"):
+        ok, d, o = fp_nacos(s, all_ids, u, p); return ("ok" if ok else "fail"), d, o
+    if fp.startswith("redis-runid:"): return fp_redis(s, all_fps, u, p, man)
+    if fp.startswith("pg:"):          return fp_pg(s, u, p, man)
+    return "ok", "TCP 可达（未做内容校验）", None
+
+def collect_ids(man):
+    return [(x["fp"], x["fp"].split(":", 1)[1]) for x in services(man) if x["fp"] and x["fp"].startswith("nacos-dataid:")]
+
+def collect_fps(man):
+    out = []
+    for x in services(man):
+        fp = x["fp"] or ""
+        if fp.startswith("redis-runid:"): out.append((fp, fp.split(":", 1)[1]))
+        if fp.startswith("pg:"): out.append((fp, fp.split(":", 1)[1]))
+    return out
+
+# ---------------- commands ----------------
+def fmt_plan(pm, ipt):
+    lines = []
+    for act, s, extra in pm:
+        lines.append(f"  [portmapper] {act:12} {s.get('env','?')}/{s.get('svc','?')} → {s.get('host')}:{s.get('target')} local={s.get('local')}")
+    for act, s, extra in ipt:
+        d = ""
+        if isinstance(extra, dict) and extra.get("to_ip"): d = f"（原指向 {extra['to_ip']}:{extra['to_port']}）"
+        elif isinstance(extra, list): d = f"（{len(extra)} 条重复规则）"
+        lines.append(f"  [iptables]   {act:12} {s['env']}/{s['svc']} {s['host']}:{s['target']} → 127.0.0.1:{s['local']} {d}")
+    return lines
+
+def cmd_plan(man, env, prune):
+    errs = validate(man)
+    if errs:
+        print(FAIL + "清单校验失败，拒绝执行（零变更）:" + NC); [print("  " + e) for e in errs]; return 1
+    pm, ipt = pm_plan(man, env, prune), ipt_plan(man, env, prune)
+    if not pm and not ipt:
+        print(PASS + "无变更（清单与运行态一致）" + NC); return 0
+    print("计划变更:"); [print(l) for l in fmt_plan(pm, ipt)]
+    print(DIM + f"共 {len(pm) + len(ipt)} 项；执行: atunnel-env apply {' '.join(filter(None,[env or '']))}" + NC)
+    return 10
+
+def cmd_apply(man, env, prune, force=False):
+    errs = validate(man)
+    if errs:
+        print(FAIL + "清单校验失败，拒绝执行（零变更）:" + NC); [print("  " + e) for e in errs]; return 1
+    pm, ipt = pm_plan(man, env, prune), ipt_plan(man, env, prune)
+    if not pm and not ipt:
+        print(PASS + "无变更（幂等）" + NC); return 0
+    print("应用变更:"); [print(l) for l in fmt_plan(pm, ipt)]
+    pm_apply(man, env, prune, dry=False)
+    _, errs2 = ipt_apply(man, env, prune, dry=False)
+    stuck = wait_hot_reload([s["local"] for s in services(man, env)])
+    probs = structural_check(man, env)
+    if errs2 or probs or stuck:
+        print(FAIL + "apply 未完全成功（以下项需处理）:" + NC)
+        for e in errs2: print("  - " + e)
+        for p_ in probs: print("  - " + p_)
+        if stuck: print(f"  - 本机端口未就绪: {stuck}（Windows 转发器未热加载）")
+        return 1
+    print(PASS + "已应用（并已通过结构自检）" + NC)
+    return 0
+
+def cmd_verify(man, env):
+    u, p = load_creds(); ids, fps = collect_ids(man), collect_fps(man)
+    bad = 0
+    warn = 0
+    for s in services(man, env):
+        lv, detail, other = fingerprint(s, ids, fps, u, p, man)
+        if lv == "ok": tag = PASS + "OK" + NC
+        elif lv == "warn": tag = WARN + "WARN(指纹过期)" + NC; warn += 1
+        elif s["optional"]: tag = WARN + "WARN(optional)" + NC
+        else: tag = FAIL + "FAIL" + NC
+        extra = FAIL + f"  ← 串到 {other}" + NC if other else ""
+        print(f"  {s['env']:14} {s['svc']:13} {s['host']}:{s['target']:<6} {tag}  {detail}{extra}")
+        if lv == "fail" and not s["optional"]: bad += 1
+    if warn: print(DIM + f"（{warn} 项指纹过期：不影响同源判定，可 atunnel refresh <env> 刷新）" + NC)
+    return 1 if bad else 0
+
+def cmd_doctor(man, env):
+    u, p = load_creds(); ids, fps = collect_ids(man), collect_fps(man)
+    print(f"{'env':14} {'service':13} {'声明地址':22} {'桥接实际目标':22} {'指纹':34} 结论")
+    bad = 0
+    for s in services(man, env):
+        first, hits = effective_dnat(s["host"], s["target"])
+        bridged = f"127.0.0.1:{first['to_port']}" if first else "（无 DNAT）"
+        mark = ""
+        if first and (first["to_ip"] != "127.0.0.1" or first["to_port"] != s["local"]):
+            bridged += f"（应 {s['local']}）"; mark = WARN + "!" + NC
+        elif len(hits) > 1:
+            bridged += f"（{len(hits)} 条重复）"; mark = WARN + "!" + NC
+        lv, detail, other = fingerprint(s, ids, fps, u, p, man)
+        if lv == "ok": verdict = PASS + "OK" + NC
+        elif lv == "warn": verdict = WARN + "WARN(指纹过期)" + NC
+        elif s["optional"]: verdict = WARN + "WARN(optional)" + NC
+        else: verdict = (FAIL + f"FAIL ← 串到 {other}" + NC) if other else (FAIL + "FAIL" + NC)
+        print(f"{s['env']:14} {s['svc']:13} {s['host'] + ':' + str(s['target']):22} {bridged + mark:22} {detail:34} {verdict}")
+        if lv == "fail" and not s["optional"]: bad += 1
+    # 跨 env 指纹交集（覆盖 nacos dataId / redis run_id / PG）
+    seen = {}
+    for s in services(man, env):
+        fp = s["fp"] or ""
+        if fp.startswith(("nacos-dataid:", "redis-runid:", "pg:")):   # 只比对"真身份"指纹，忽略 tcp-only
+            seen.setdefault(fp, []).append(f'{s["env"]}/{s["svc"]}')
+    dup = {k: v for k, v in seen.items() if len(v) > 1}
+    stale = [c for c in ipt_plan(man, env, prune=True) if c[0].endswith("-stale")]
+    if dup: print(WARN + f"警告: 多个服务声明了相同指纹 {dup}" + NC); bad += 1
+    if stale:
+        print(WARN + f"提示: 存在 {len(stale)} 条清单外规则（用 apply --prune 清理）: " +
+              ", ".join(f'{c[1]["svc"]}' for c in stale) + NC)
+    return 1 if bad else 0
+
+def cmd_fingerprint(man, env):
+    u, p = load_creds()
+    for s in services(man, env):
+        lv, d, _ = fingerprint(s, collect_ids(man), collect_fps(man), u, p, man)
+        print(f"  {s['env']}/{s['svc']:13} {s['host']}:{s['target']:<6} {d}")
+    return 0
+
+def cmd_preflight(man, env, role=None):
+    if env not in man["envs"]:
+        print(FAIL + f"未知 env: {env}（可用: {', '.join(man['envs'])}）" + NC); return 1
+    errs = validate(man)
+    if errs: print(FAIL + "清单校验失败: " + "; ".join(errs) + NC); return 1
+    u, p = load_creds(); ids, fps = collect_ids(man), collect_fps(man)
+    bad, info = [], []
+    for s in services(man, env):
+        lv, detail, other = fingerprint(s, ids, fps, u, p, man)
+        if lv == "fail": bad.append(f'{s["svc"]}({detail}{"; 串到 " + other if other else ""})')
+        elif s["svc"] in ("nacos", "redis", "pg"): info.append(f'{s["svc"]}={detail}')
+    if bad:
+        print(FAIL + f"preflight 失败 [{env}]:" + NC)
+        for b in bad: print("  - " + b)
+        return 1
+    # 端口检查：--role 时严格（该角色端口必须空闲）；无 --role 时仅"被其它 env 声明且已占用"才失败
+    rows = env_runtime_ports(man, env)
+    if role is None: rows = [r for r in rows if r["role"] != "frontend"]
+    else: rows = [r for r in rows if r["role"] == role]
+    live = listening_ports(); allr = env_runtime_ports(man)
+    for r in rows:
+        if r["port"] not in live: continue
+        owner = port_owner(r["port"])
+        foreign = [x for x in allr if x["port"] == r["port"] and x["env"] != env]
+        if role is not None:
+            bad.append(f'{r["role"]}({r["port"]}) 已被占用：{owner}（如为本项目已在运行的实例请先停掉）')
+        elif foreign:
+            bad.append(f'{r["role"]}({r["port"]}) 与 {foreign[0]["env"]} 声明冲突且已占用：{owner}')
+    if bad:
+        print(FAIL + f"preflight 失败 [{env}]:" + NC)
+        for b in bad: print("  - " + b)
+        return 1
+    nacos_addr = next((f'{s["host"]}:{s["target"]}' for s in services(man, env) if s["svc"] == "nacos"), "-")
+    portinfo = f'；ports={{{", ".join(f"{r[chr(114)+chr(111)+chr(108)+chr(101)]}:{r[chr(112)+chr(111)+chr(114)+chr(116)]}" for r in env_runtime_ports(man, env))}}}'
+    print(PASS + f"preflight OK [{env}] — {len(services(man, env))} 个端点同源；nacos={nacos_addr}；" + "; ".join(info) + portinfo + NC)
+    return 0
+
+def cmd_ports(man, env, check=False):
+    rows = env_runtime_ports(man, env)
+    live = listening_ports()
+    print(f"{'env':14} {'role':10} {'port':<6} 监听   占用者")
+    for r in rows:
+        occ = r["port"] in live
+        print(f'{r["env"]:14} {r["role"]:10} {r["port"]:<6} {"是" if occ else "否":6} {port_owner(r["port"]) if occ else "-"}')
+    for e, band in (man.get("port_bands") or {}).items():
+        print(f"  段约定 {e}: {band}")
+    if check:
+        errs = [x for x in validate(man) if x.startswith("[I5]")]
+        live_rows = [r for r in rows if r["port"] in live]
+        allr = env_runtime_ports(man)
+        for r in live_rows:
+            foreign = [x for x in allr if x["port"] == r["port"] and x["env"] != r["env"]]
+            if foreign: errs.append(f'[运行时] 端口 {r["port"]} 被 {foreign[0]["env"]} 声明，且本机已在监听（{port_owner(r["port"])}）')
+        if errs:
+            print(FAIL + "端口检查失败:" + NC)
+            for x in errs: print("  - " + x)
+            return 1
+        print(PASS + f"端口检查通过（{len(rows)} 条声明：无跨 env 冲突、无段内重复、无与本机监听冲突）" + NC)
+    return 0
+
+def cmd_list(man, _):
+    for e, d in man["envs"].items():
+        print(f"{e}  host={d.get('host') or '(按服务)'}  owner={d.get('owner','-')}")
+        for s, c in d["services"].items():
+            h = c.get("host", d.get("host"))
+            opt = " [optional]" if c.get("optional") else ""
+            print(f"    {s:14} 内网 {h}:{c['target']:<6} → 本机 127.0.0.1:{c['local']:<6} fp={c.get('fingerprint','-')}{opt}")
+    return 0
+
+def cmd_refresh(man, env):
+    """把实测指纹写回清单（先备份）。只更新 redis-runid / pg 这类"会随实例重启变化"的项。"""
+    u, p = load_creds()
+    raw = load_manifest()
+    changes = []
+    for s in services(raw, env):
+        fp = s["fp"] or ""
+        if fp.startswith("redis-runid:"):
+            pw = redis_pw(s["env"], s["host"], s["tenant"], u, p)
+            rid = _redis_run_id(s["host"], s["target"], pw)
+            if rid and rid != fp.split(":", 1)[1]:
+                raw["envs"][s["env"]]["services"][s["svc"]]["fingerprint"] = f"redis-runid:{rid}"
+                changes.append((s["env"], s["svc"], fp, f"redis-runid:{rid}"))
+        elif fp.startswith("pg:"):
+            addr = _pg_addr(s, u, p)
+            if addr and addr != fp.split(":", 1)[1]:
+                raw["envs"][s["env"]]["services"][s["svc"]]["fingerprint"] = f"pg:{addr}"
+                changes.append((s["env"], s["svc"], fp, f"pg:{addr}"))
+    if not changes:
+        print(PASS + "指纹无需刷新" + NC); return 0
+    backup(MAN, "environments.json")
+    with open(MAN, "w", encoding="utf-8") as f:
+        json.dump(raw, f, ensure_ascii=False, indent=2)
+    for e, svc, old, new in changes:
+        print(f"  {e}/{svc}: {old} → {new}")
+    print(PASS + f"已刷新 {len(changes)} 项（清单已备份）" + NC)
+    return 0
+
+def cmd_selftest(man, _):
+    """纯内存自检（不触碰系统状态）"""
+    import copy
+    fails = []
+    def ck(name, cond):
+        print(("  " + (PASS + "PASS" if cond else FAIL + "FAIL") + NC) + f"  {name}")
+        if not cond: fails.append(name)
+    print("=== atunnel-env selftest（只读，不改系统）===")
+    ck("manifest 合法且 I1/I3 无违规", validate(man) == [])
+    bad = copy.deepcopy(man)
+    bad["envs"]["dev-hydrology"]["services"]["nacos"]["local"] = 58204
+    ck("能检出 I1 local 冲突", any("I1" in e for e in validate(bad)))
+    bad2 = copy.deepcopy(man)
+    bad2["envs"]["dev-hydrology"]["services"]["redis"]["fingerprint"] = None
+    ck("能检出 I3 关键服务缺指纹", any("I3" in e for e in validate(bad2)))
+    bs = "\n".join([f"-A OUTPUT -d 1.2.3.4/32 -p tcp -m tcp --dport 1234 -j DNAT --to-destination 127.0.0.1:1234",
+                    "-A OUTPUT -d 1.2.3.4/32 -p tcp --dport 1235 -j DNAT --to-destination 127.0.0.1:1235",
+                    "-A POSTROUTING -d 127.0.0.1/32 -m comment --comment x -p tcp --dport 99 -j SNAT --to-source 127.0.0.1"])
+    ck("规则解析兼容带 -m tcp / 带 -m comment 的形态", len([l for l in bs.splitlines()]) == 3 and _rule_probe(bs) == 3)
+    ck("manifest 的 local 与 (host,target) 一一对应", len({s['local'] for s in services(man)}) == len({(s['host'], s['target']) for s in services(man)}))
+    bad5 = copy.deepcopy(man)
+    bad5["envs"]["dev-flood"]["runtime_ports"]["auth"] = bad5["envs"]["dev-hydrology"]["runtime_ports"]["auth"]
+    ck("能检出 I5 跨 env 进程端口冲突", any("I5" in e for e in validate(bad5)))
+    ck("真实 manifest 的进程端口无冲突", not [e for e in validate(man) if e.startswith("[I5]")])
+    ck("未知 env 会被拒绝", cmd_preflight(man, "__nope__") == 1)
+    print("=== 结果: " + ("全部通过" if not fails else f"{len(fails)} 项失败: {fails}") + " ===")
+    return 1 if fails else 0
+
+def _rule_probe(text):
+    """用与 nat_rules 相同的正则逻辑解析给定文本（供 selftest 使用）"""
+    n = 0
+    for line in text.splitlines():
+        line = line.strip()
+        if not line.startswith("-A "): continue
+        m_d = re.search(r"(?:^|\s)-d (\S+)", line)
+        m_p = re.search(r"--dport (\d+)", line)
+        m_j = re.search(r"-j (DNAT|SNAT|REDIRECT)", line)
+        if m_d and m_p and m_j: n += 1
+    return n
+
+def main():
+    args = list(sys.argv[1:])
+    role = None
+    if "--role" in args:
+        i = args.index("--role")
+        role = args[i + 1] if i + 1 < len(args) else None
+        del args[i:i + 2]
+    prune = "--prune" in args; force = "--force" in args; check = "--check" in args
+    args = [a for a in args if not a.startswith("--")]
+    if not args:
+        print(__doc__); return 1
+    cmd, env = args[0], (args[1] if len(args) > 1 else None)
+    man = load_manifest()
+    FP2ENV.clear(); FP2ENV.update({x["fp"]: x["env"] for x in services(man) if x["fp"]})
+    if cmd in ("version", "--version"):
+        print(f"atunnel-env {VERSION}")
+        return 0
+    if cmd == "selftest": return cmd_selftest(man, env)
+    if env and env not in man["envs"]:
+        print(FAIL + f"未知 env: {env}（可用: {', '.join(man['envs'])}）" + NC); return 1
+    if cmd in ("list", "show"):  return cmd_list(man, env)
+    if cmd == "plan":            return cmd_plan(man, env, prune)
+    if cmd == "apply":           return cmd_apply(man, env, prune, force)
+    if cmd == "verify":
+        if not env: print("用法: atunnel-env verify <env>"); return 1
+        return cmd_verify(man, env)
+    if cmd == "doctor":          return cmd_doctor(man, env)
+    if cmd == "ports":           return cmd_ports(man, env, check)
+    if cmd == "refresh":         return cmd_refresh(man, env)
+    if cmd == "fingerprint":
+        if not env: print("用法: atunnel-env fingerprint <env>"); return 1
+        return cmd_fingerprint(man, env)
+    if cmd == "preflight":
+        if not env: print("用法: atunnel-env preflight <env>"); return 1
+        return cmd_preflight(man, env, role)
+    print(__doc__); return 1
+
+if __name__ == "__main__":
+    sys.exit(main())
